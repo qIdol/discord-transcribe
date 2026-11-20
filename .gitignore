@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and personal config (examples are committed instead)
+.env
+PROMPT_FILE
+
+# Recordings and transcripts are private: keep the folder, ignore its contents
+recordings/*
+!recordings/.gitkeep

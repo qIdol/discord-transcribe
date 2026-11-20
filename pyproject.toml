@@ -1,0 +1,16 @@
+[project]
+name = "groq-transcriptions"
+version = "0.1.0"
+description = "Transcribe Discord calls recorded with Craig (multi-track, per-speaker) or any audio file using Groq Whisper."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Dawid Golicki", email = "golicki.dawid@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "openai>=3.57.0",
+    "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
+]
