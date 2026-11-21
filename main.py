@@ -49,6 +49,7 @@ BYTES_PER_SAMPLE = 2    # 16-bit PCM
 MIN_SILENCE = 1.0       # Seconds of quiet needed to count as a pause (shorter = within speech)
 PADDING = 0.3           # Seconds kept before/after each speech region so words aren't clipped
 GAP = 1.0               # Seconds of silence inserted between kept regions, so Whisper sees pauses
+MAX_CHUNK_SECONDS = 20 * 60  # Longest condensed audio per upload: ~14 MB of FLAC, under the 25 MB limit
 
 # A progress callback receives "seconds of audio processed so far"
 ProgressCallback = Callable[[float], None] | None
@@ -204,8 +205,13 @@ def adts_duration(path: Path) -> float:
     while i + 7 <= len(data):
         if data[i] != 0xFF or (data[i + 1] & 0xF0) != 0xF0:
             break  # Not a frame header (corrupt or trailing data): stop counting
-        rate = sample_rates[(data[i + 2] >> 2) & 0x0F]
+        rate_index = (data[i + 2] >> 2) & 0x0F
         frame_length = ((data[i + 3] & 0x03) << 11) | (data[i + 4] << 3) | (data[i + 5] >> 5)
+        # Guard against corrupt headers: a length below the 7-byte header size
+        # would never advance i (endless loop), and indexes 13-15 aren't valid rates
+        if frame_length < 7 or rate_index >= len(sample_rates):
+            break
+        rate = sample_rates[rate_index]
         blocks = (data[i + 6] & 0x03) + 1
         seconds += blocks * 1024 / rate
         i += frame_length
@@ -270,15 +276,23 @@ def format_timestamp(seconds: float) -> str:
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
-def detect_speech(track: Path, silence_db: float,
+def detect_speech(track: Path, silence_db: float, duration: float | None,
                   on_progress: ProgressCallback = None) -> list[tuple[float, float]]:
-    """Return (start, end) times in seconds of the parts of `track` with speech."""
+    """Return (start, end) times in seconds of the parts of `track` with speech.
+
+    `duration` is the track length (None if unknown); it's used to recognise a
+    silence that runs right to the end of the file.
+    """
     # ffmpeg's silencedetect filter logs "silence_start: X" / "silence_end: Y".
     # "-f null -" decodes the whole file without writing any output.
     log = run_ffmpeg(["-i", str(track), "-af", f"silencedetect=noise={silence_db}dB:d={MIN_SILENCE}",
                       "-f", "null", "-"], on_progress)
-    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log)]
-    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log)]
+    # ffmpeg can log a slightly negative start (e.g. -0.0213) for silence at
+    # the very beginning, so the pattern allows a minus sign and the value is
+    # clamped to 0. Missing it would shift every start/end pair out of step.
+    number = r"(-?\d+(?:\.\d+)?)"
+    starts = [max(0.0, float(x)) for x in re.findall(rf"silence_start: {number}", log)]
+    ends = [max(0.0, float(x)) for x in re.findall(rf"silence_end: {number}", log)]
 
     # Speech is everything *between* silences. Build the list of silences
     # (a silence running to the end of the file has no silence_end) and invert it.
@@ -288,8 +302,14 @@ def detect_speech(track: Path, silence_db: float,
         if s_start > cursor:
             speech.append((cursor, s_start))
         cursor = s_end
-    if cursor != float("inf"):
-        speech.append((cursor, float("inf")))  # Speech until the end of the file
+    # After the last silence there's speech until the end of the file, unless
+    # that silence itself reached the end. (ffmpeg 6+ logs a silence_end at the
+    # end of the file, so cursor is then the track length rather than inf.)
+    # Without this check a track that is silent at the end, or entirely silent,
+    # would get a junk region of pure silence and never be skipped.
+    reaches_end = cursor == float("inf") or (duration is not None and cursor >= duration - 0.05)
+    if not reaches_end:
+        speech.append((cursor, float("inf")))
 
     # Pad each region a little and merge regions that now overlap
     merged: list[tuple[float, float]] = []
@@ -302,39 +322,75 @@ def detect_speech(track: Path, silence_db: float,
     return merged
 
 
-def condense_track(track: Path, regions: list[tuple[float, float]], out_path: Path,
-                   on_progress: ProgressCallback = None) -> tuple[list[tuple[float, float]], float]:
-    """Write only the speech `regions` of `track` to `out_path` as 16 kHz mono FLAC.
+def decode_pcm(track: Path, work_dir: Path, on_progress: ProgressCallback = None) -> bytes:
+    """Decode `track` to raw 16 kHz mono 16-bit PCM ("-f s16le") and return the bytes.
+
+    This takes about 1.9 MB per minute: ~48 MB for 25 minutes, ~350 MB for 3 hours.
+    """
+    pcm_path = work_dir / f"{track.stem}.pcm"
+    run_ffmpeg(["-i", str(track), "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", str(pcm_path)],
+               on_progress)
+    pcm = pcm_path.read_bytes()
+    pcm_path.unlink()  # Free the disk space; the data is in memory now
+    return pcm
+
+
+def plan_chunks(regions: list[tuple[float, float]], total_seconds: float) -> list[list[tuple[float, float]]]:
+    """Group speech regions into chunks whose condensed audio fits one upload.
+
+    Groq's free tier accepts 25 MB per file. 16 kHz mono FLAC is about 0.7 MB
+    per minute of speech, so a talkative person in a long call can go over that.
+    Each chunk holds at most MAX_CHUNK_SECONDS of audio and is cut between
+    speech regions, so no words are split. (A single region longer than that,
+    i.e. a monologue with no 1-second pause, is cut into pieces.)
+    """
+    chunks: list[list[tuple[float, float]]] = [[]]
+    length = 0.0  # Condensed length of the chunk being filled
+    for start, end in regions:
+        end = min(end, total_seconds)  # "inf" means "until the end of the file"
+        while end - start > 0:
+            piece_end = min(end, start + MAX_CHUNK_SECONDS)
+            piece_length = piece_end - start + GAP
+            if chunks[-1] and length + piece_length > MAX_CHUNK_SECONDS:
+                chunks.append([])  # This piece doesn't fit, start a new chunk
+                length = 0.0
+            chunks[-1].append((start, piece_end))
+            length += piece_length
+            start = piece_end
+    return [c for c in chunks if c]
+
+
+def write_condensed(pcm: bytes, regions: list[tuple[float, float]],
+                    out_path: Path) -> tuple[list[tuple[float, float]], float]:
+    """Write only the speech `regions` of `pcm` to `out_path` as 16 kHz mono FLAC.
 
     Returns (time_map, duration). time_map holds, for each kept region,
     (position in condensed file, position in original file) and is used later
     to translate timestamps back. duration is the condensed length in seconds.
     """
-    # Decode the whole track to raw 16-bit mono PCM ("-f s16le"). 25 minutes is
-    # ~48 MB, which is fine to hold in memory.
-    pcm_path = out_path.with_suffix(".pcm")
-    run_ffmpeg(["-i", str(track), "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", str(pcm_path)],
-               on_progress)
-    pcm = pcm_path.read_bytes()
-
     def to_byte(seconds: float) -> int:
         # Convert a time to a byte offset, clamped to the audio length
-        # (a region may end at infinity, meaning "until the end of the file")
-        if seconds == float("inf"):
-            return len(pcm)
         return min(len(pcm), int(seconds * SAMPLE_RATE) * BYTES_PER_SAMPLE)
 
     gap = b"\x00" * to_byte(GAP)  # Digital silence (all-zero samples)
-    pieces, time_map, condensed_pos = [], [], 0.0
-    for start, end in regions:
-        chunk = pcm[to_byte(start):to_byte(end)]
-        time_map.append((condensed_pos, start))
-        pieces += [chunk, gap]
-        condensed_pos += (len(chunk) + len(gap)) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+    view = memoryview(pcm)  # Slicing a memoryview doesn't copy the audio
+    time_map, condensed_pos = [], 0.0
+    pcm_path = out_path.with_suffix(".pcm")
 
-    # Encode the joined pieces to FLAC: lossless and roughly half the size of raw PCM.
+    # Write each piece straight to disk instead of joining them in memory,
+    # so a long track isn't held in memory twice
+    with open(pcm_path, "wb") as f:
+        for start, end in regions:
+            chunk = view[to_byte(start):to_byte(end)]
+            time_map.append((condensed_pos, start))
+            f.write(chunk)
+            f.write(gap)
+            condensed_pos += (len(chunk) + len(gap)) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+
+    # Encode to FLAC: lossless and roughly a third of the size of raw PCM.
+    # (Opus would be ~5x smaller still, but in a test it dropped ~8% of the
+    # words and cut off Polish word endings, so lossless it is.)
     # "-f s16le -ar -ac" before "-i" tells ffmpeg how to read the raw samples.
-    pcm_path.write_bytes(b"".join(pieces))
     run_ffmpeg(["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", str(pcm_path), str(out_path)])
     pcm_path.unlink()  # The raw file is no longer needed
     return time_map, condensed_pos
@@ -437,7 +493,7 @@ def transcribe_multitrack(client: OpenAI, tracks: list[Path], params: dict,
             # Step 1: find where this person speaks
             progress.start_task(row)
             progress.update(row, total=duration, completed=0, status="[yellow]detecting speech[/]")
-            regions = detect_speech(track, silence_db, advance_to)
+            regions = detect_speech(track, silence_db, duration, advance_to)
             progress.advance(overall)
 
             if not regions:
@@ -445,20 +501,30 @@ def transcribe_multitrack(client: OpenAI, tracks: list[Path], params: dict,
                 progress.advance(overall, steps_per_track - 1)
                 continue  # This person never spoke, nothing to send
 
-            # Step 2: cut the silence out
+            # Step 2: cut the silence out, split into upload-sized chunks
             progress.update(row, total=duration, completed=0, status="[yellow]cutting silence[/]")
-            condensed = work_dir / f"{track.stem}.flac"
-            time_map, kept_seconds = condense_track(track, regions, condensed, advance_to)
+            pcm = decode_pcm(track, work_dir, advance_to)
+            total_seconds = len(pcm) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+            chunks = []  # (condensed file, time_map, condensed seconds) per chunk
+            for n, chunk_regions in enumerate(plan_chunks(regions, total_seconds), start=1):
+                out = work_dir / f"{track.stem}_{n}.flac"
+                chunks.append((out, *write_condensed(pcm, chunk_regions, out)))
+            del pcm  # Release the decoded track before uploading
+            kept_seconds = sum(seconds for _, _, seconds in chunks)
             progress.advance(overall)
 
             # Step 3: upload and wait for Groq. There's no way to know how far
             # along the server is, so total=None makes the bar pulse instead.
-            progress.update(row, total=None,
-                            status=f"[cyan]transcribing {kept_seconds / 60:.1f} min on Groq ☁[/]")
-            result = transcribe(client, condensed, params).model_dump()
+            utterances = []
+            for n, (condensed, time_map, seconds) in enumerate(chunks, start=1):
+                part = f" (part {n}/{len(chunks)})" if len(chunks) > 1 else ""
+                progress.update(row, total=None,
+                                status=f"[cyan]transcribing {seconds / 60:.1f} min on Groq{part} ☁[/]")
+                result = transcribe(client, condensed, params).model_dump()
+                utterances += [u for u in words_to_utterances(result.get("words") or [], time_map)
+                               if u["text"]]
             progress.advance(overall)
 
-            utterances = [u for u in words_to_utterances(result.get("words") or [], time_map) if u["text"]]
             segments += [{"speaker": speaker, **u} for u in utterances]
             stats.append({
                 "speaker": speaker,
