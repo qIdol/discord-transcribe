@@ -49,7 +49,35 @@ BYTES_PER_SAMPLE = 2    # 16-bit PCM
 MIN_SILENCE = 1.0       # Seconds of quiet needed to count as a pause (shorter = within speech)
 PADDING = 0.3           # Seconds kept before/after each speech region so words aren't clipped
 GAP = 1.0               # Seconds of silence inserted between kept regions, so Whisper sees pauses
-MAX_CHUNK_SECONDS = 20 * 60  # Longest condensed audio per upload: ~14 MB of FLAC, under the 25 MB limit
+# Longest condensed audio per upload. Whisper sometimes skips or garbles a
+# 30-second stretch of long audio; on an 18-minute upload that lost ~36 s of
+# speech, with 2-minute uploads only ~17 s (and the repair pass below gets the
+# rest). It also keeps every file far below the 25 MB limit (~1.4 MB of FLAC).
+MAX_CHUNK_SECONDS = 2 * 60
+
+# Repair pass: a speech region of at least MIN_REPAIR_SECONDS that comes back
+# with fewer than MIN_WORDS_PER_SECOND words is re-transcribed on its own.
+MIN_REPAIR_SECONDS = 1.0
+MIN_WORDS_PER_SECOND = 0.5
+
+# A repair whose whole result is one of these stock phrases is rejected: it's
+# what Whisper "hears" in a lone noise (cough, keyboard), learned from video
+# subtitles. Compared lowercase, without punctuation.
+STOCK_HALLUCINATIONS = {
+    "dziękuję", "dziękuję za uwagę", "dzięki za uwagę", "dziękuję za obejrzenie",
+    "dzięki za obejrzenie", "napisy stworzone przez społeczność amaraorg",
+    "thank you", "thank you for watching", "thanks for watching",
+}
+
+# How much of the previous chunk's transcript is sent as context with the next
+# chunk (Whisper's prompt is read as "the text that came just before"). The
+# PROMPT_FILE text comes first; Whisper only uses ~224 tokens in total.
+CONTEXT_CHARS = 250
+
+# Hallucination filter: HALLUCINATION_RUN or more consecutive words that are
+# each shorter than HALLUCINATION_WORD_SECONDS are made up and get dropped.
+HALLUCINATION_RUN = 5
+HALLUCINATION_WORD_SECONDS = 0.05
 
 # A progress callback receives "seconds of audio processed so far"
 ProgressCallback = Callable[[float], None] | None
@@ -414,27 +442,145 @@ def to_original_time(t: float, time_map: list[tuple[float, float]], index: int) 
     return original_start + (t - condensed_start)
 
 
-def words_to_utterances(words: list[dict], time_map: list[tuple[float, float]]) -> list[dict]:
-    """Group word timestamps into one utterance per speech region.
+def drop_hallucinated_runs(words: list[dict]) -> list[dict]:
+    """Remove runs of words that Whisper made up instead of transcribing.
 
-    Whisper's *segments* can span several regions (it happily joins speech from
-    minute 2 and minute 23 once the silence between is cut out), which would
-    give later words a wrong timestamp. Words each have their own timestamp, so
-    assigning words to regions keeps every utterance at its true time.
+    When one of Whisper's 30-second decoding windows goes wrong, it can emit a
+    loop like "niech to się dzieje, ale niech to się dzieje" for speech it
+    didn't actually recognise. Those words come back squashed onto one instant
+    (each under HALLUCINATION_WORD_SECONDS long), while real words almost never
+    do this more than two or three in a row.
     """
-    utterances = []
-    current_index = None
+    def is_squashed(w: dict) -> bool:
+        return w["end"] - w["start"] < HALLUCINATION_WORD_SECONDS
+
+    kept, run = [], []
     for w in words:
-        index = region_index(w["start"], time_map)
-        if index != current_index:  # A new region starts a new utterance
-            utterances.append({"start": to_original_time(w["start"], time_map, index), "words": []})
-            current_index = index
-        utterances[-1]["words"].append(w["word"].strip())
-        utterances[-1]["end"] = to_original_time(w["end"], time_map, index)
-    return [
-        {"start": round(u["start"], 2), "end": round(u["end"], 2), "text": " ".join(u["words"])}
-        for u in utterances
-    ]
+        if is_squashed(w):
+            run.append(w)
+            continue
+        if len(run) < HALLUCINATION_RUN:
+            kept += run  # A short run is normal, keep it
+        run = []
+        kept.append(w)
+    if len(run) < HALLUCINATION_RUN:
+        kept += run
+    return kept
+
+
+def pick_region(start: float, end: float, spans: list[tuple[float, float]],
+                time_map: list[tuple[float, float]]) -> int | None:
+    """Decide which speech region a word (condensed-file times) belongs to.
+
+    Word timestamps are approximate, and how they're off depends on the model:
+    whisper-large-v3 tends to start words late, whisper-large-v3-turbo early.
+    Either way a word can start inside the silent gap next to its region. So
+    the word goes to the region its time span overlaps most. If it overlaps
+    none, it goes to the nearer neighbour, unless it's squashed, which marks an
+    invented word (returns None).
+    """
+    i = region_index(start, time_map)
+    candidates = [j for j in (i, i + 1) if j < len(spans)]
+
+    def overlap(j: int) -> float:
+        return max(0.0, min(end, spans[j][1]) - max(start, spans[j][0]))
+
+    best = max(candidates, key=overlap)
+    if overlap(best) > 0:
+        return best
+    if end - start < HALLUCINATION_WORD_SECONDS:
+        return None  # Squashed and touching no audio: made up
+    if start >= spans[-1][1] + GAP:
+        return None  # Past the end of the audio: impossible
+
+    def distance(j: int) -> float:
+        return max(spans[j][0] - end, start - spans[j][1], 0.0)
+
+    return min(candidates, key=distance)
+
+
+def transcribe_regions(client: OpenAI, pcm: bytes, regions: list[tuple[float, float]],
+                       params: dict, out_path: Path) -> list[list[dict]]:
+    """Transcribe the speech `regions` of `pcm` in one upload.
+
+    Returns one list of words per region, each word as {"word", "start", "end"}
+    with times in the original recording.
+
+    Words are assigned to regions by their own timestamps, not via Whisper's
+    *segments*: segments can span several regions (Whisper happily joins speech
+    from minute 2 and minute 23 once the silence between is cut out), which
+    would give later words a wrong timestamp.
+    """
+    time_map, _ = write_condensed(pcm, regions, out_path)
+    result = transcribe(client, out_path, params).model_dump()
+    out_path.unlink()  # Free the disk space
+
+    # Where each region's audio sits in the condensed file. Between them are the
+    # inserted gaps of pure digital silence.
+    spans = [(c, c + (end - start)) for (c, _), (start, end) in zip(time_map, regions)]
+
+    per_region: list[list[dict]] = [[] for _ in regions]
+    for w in drop_hallucinated_runs(result.get("words") or []):
+        i = pick_region(w["start"], w["end"], spans, time_map)
+        if i is None:
+            # The word doesn't touch any audio. Words Whisper invents at the end
+            # of a region ("to zrobić.", "Dzięki za oglądanie!") look like this:
+            # inside a silent gap or past the end, and squashed to ~0.02 s.
+            continue
+        region_start, region_end = regions[i]
+        per_region[i].append({
+            "word": w["word"].strip(),
+            # Clamp to the region: Whisper often stretches a word over the
+            # neighbouring silence, which made utterances "end" 30+ s too late
+            "start": max(region_start, min(to_original_time(w["start"], time_map, i), region_end)),
+            "end": max(region_start, min(to_original_time(w["end"], time_map, i), region_end)),
+        })
+    return per_region
+
+
+def is_stock_hallucination(words: list[dict]) -> bool:
+    """True if `words` say nothing but a phrase from STOCK_HALLUCINATIONS."""
+    text = " ".join(w["word"] for w in words).lower()
+    text = re.sub(r"[^\w\s]", "", text)  # Drop punctuation: "Uwagę!" -> "uwagę"
+    return " ".join(text.split()) in STOCK_HALLUCINATIONS
+
+
+def with_context(params: dict, previous_text: str) -> dict:
+    """Return `params` with the tail of the previous chunk's text added to the prompt."""
+    tail = previous_text[-CONTEXT_CHARS:]
+    if " " in tail:
+        tail = tail[tail.index(" ") + 1:]  # Don't start mid-word
+    prompt = " ".join(p for p in (params.get("prompt", ""), tail) if p)
+    return {**params, "prompt": prompt} if prompt else params
+
+
+def collapse_repeats(text: str) -> str:
+    """Remove a sentence that just repeats the end of the sentence before it.
+
+    "...bo to jest bardzo przydatne. To jest bardzo przydatne." -> the second
+    copy goes. Only sentences of 3+ words count, so a real "Tak. Tak." stays.
+    """
+    def words_of(sentence: str) -> list[str]:
+        return re.sub(r"[^\w\s]", "", sentence).lower().split()
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept: list[str] = []
+    for s in sentences:
+        current = words_of(s)
+        if kept and len(current) >= 3 and words_of(kept[-1])[-len(current):] == current:
+            continue  # Whisper repeated itself
+        kept.append(s)
+    return " ".join(kept)
+
+
+def is_starved(region: tuple[float, float], words: list[dict]) -> bool:
+    """True if a region clearly contains speech but got (almost) no words back.
+
+    That's the sign of Whisper skipping part of the audio. Normal speech is
+    2-3 words per second, so under MIN_WORDS_PER_SECOND means words are missing.
+    """
+    length = region[1] - region[0]
+    return length >= MIN_REPAIR_SECONDS and len(words) / length < MIN_WORDS_PER_SECOND
 
 
 def make_progress() -> Progress:
@@ -463,7 +609,7 @@ def transcribe_multitrack(client: OpenAI, tracks: list[Path], params: dict,
     for the summary table.
     """
     # Timestamps only exist in verbose_json, so force it here, and ask for a
-    # timestamp per word (see words_to_utterances for why)
+    # timestamp per word (see transcribe_regions for why)
     params = {**params, "response_format": "verbose_json",
               "timestamp_granularities": ["word", "segment"]}
 
@@ -496,34 +642,70 @@ def transcribe_multitrack(client: OpenAI, tracks: list[Path], params: dict,
             regions = detect_speech(track, silence_db, duration, advance_to)
             progress.advance(overall)
 
+            # Sanity check: in a normal call each person talks a fraction of the
+            # time. If almost the whole track counts as speech, the track has
+            # background noise above --silence-db, silence removal did nothing,
+            # and Whisper will invent text in the "silence" again.
+            if duration and duration > 60:
+                speech_share = sum(min(end, duration) - start for start, end in regions) / duration
+                if speech_share > 0.8:
+                    console.print(f"[yellow]⚠ {escape(speaker)}: {speech_share:.0%} of the track counts as "
+                                  f"speech, probably background noise. Try a higher --silence-db "
+                                  f"(now {silence_db:g}, e.g. {silence_db + 10:g}).[/]")
+
             if not regions:
                 progress.update(row, total=1, completed=1, status="[dim]no speech, skipped[/]")
                 progress.advance(overall, steps_per_track - 1)
                 continue  # This person never spoke, nothing to send
 
-            # Step 2: cut the silence out, split into upload-sized chunks
+            # Step 2: decode the track and split its speech into upload-sized chunks
             progress.update(row, total=duration, completed=0, status="[yellow]cutting silence[/]")
             pcm = decode_pcm(track, work_dir, advance_to)
-            total_seconds = len(pcm) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-            chunks = []  # (condensed file, time_map, condensed seconds) per chunk
-            for n, chunk_regions in enumerate(plan_chunks(regions, total_seconds), start=1):
-                out = work_dir / f"{track.stem}_{n}.flac"
-                chunks.append((out, *write_condensed(pcm, chunk_regions, out)))
-            del pcm  # Release the decoded track before uploading
-            kept_seconds = sum(seconds for _, _, seconds in chunks)
+            chunks = plan_chunks(regions, len(pcm) / (SAMPLE_RATE * BYTES_PER_SAMPLE))
+            all_regions = [r for chunk in chunks for r in chunk]  # Long regions may have been split
+            kept_seconds = sum(end - start for start, end in all_regions)
             progress.advance(overall)
 
-            # Step 3: upload and wait for Groq. There's no way to know how far
-            # along the server is, so total=None makes the bar pulse instead.
-            utterances = []
-            for n, (condensed, time_map, seconds) in enumerate(chunks, start=1):
-                part = f" (part {n}/{len(chunks)})" if len(chunks) > 1 else ""
-                progress.update(row, total=None,
-                                status=f"[cyan]transcribing {seconds / 60:.1f} min on Groq{part} ☁[/]")
-                result = transcribe(client, condensed, params).model_dump()
-                utterances += [u for u in words_to_utterances(result.get("words") or [], time_map)
-                               if u["text"]]
+            # Step 3: upload each chunk and wait for Groq. The bar counts chunks;
+            # within one, there's no way to know how far along the server is.
+            progress.update(row, total=len(chunks), completed=0,
+                            status=f"[cyan]transcribing {kept_seconds / 60:.1f} min on Groq ☁[/]")
+            words_per_region: list[list[dict]] = []
+            previous_text = ""  # Carried over as context into the next chunk
+            for n, chunk in enumerate(chunks, start=1):
+                chunk_words = transcribe_regions(client, pcm, chunk, with_context(params, previous_text),
+                                                 work_dir / f"{track.stem}_{n}.flac")
+                words_per_region += chunk_words
+                previous_text = " ".join(w["word"] for words in chunk_words for w in words)
+                progress.update(row, completed=n)
+
+            # Repair pass: re-transcribe every region where Whisper skipped the
+            # speech, together with its neighbouring regions. The neighbours
+            # give Whisper real speech around it; alone, a short region is where
+            # it invents things like "Dziękuję za uwagę". Only the words that
+            # land in the starved region are used, and only if there are more
+            # of them than before and they aren't just a stock phrase.
+            starved = [i for i, r in enumerate(all_regions) if is_starved(r, words_per_region[i])]
+            if starved:
+                progress.update(row, total=len(starved), completed=0,
+                                status=f"[yellow]repairing {len(starved)} skipped passage(s)[/]")
+            for n, i in enumerate(starved, start=1):
+                lo, hi = max(0, i - 1), min(len(all_regions), i + 2)  # The region and its neighbours
+                retry = transcribe_regions(client, pcm, all_regions[lo:hi], params,
+                                           work_dir / f"{track.stem}_repair.flac")[i - lo]
+                if len(retry) > len(words_per_region[i]) and not is_stock_hallucination(retry):
+                    words_per_region[i] = retry
+                progress.update(row, completed=n)
+            still_missing = sum(is_starved(r, w) for r, w in zip(all_regions, words_per_region))
+            del pcm  # Release the decoded track
             progress.advance(overall)
+
+            # One utterance per speech region
+            utterances = [
+                {"start": round(words[0]["start"], 2), "end": round(words[-1]["end"], 2),
+                 "text": collapse_repeats(" ".join(w["word"] for w in words))}
+                for words in words_per_region if words
+            ]
 
             segments += [{"speaker": speaker, **u} for u in utterances]
             stats.append({
@@ -532,8 +714,10 @@ def transcribe_multitrack(client: OpenAI, tracks: list[Path], params: dict,
                 "utterances": len(utterances),
                 "words": sum(len(u["text"].split()) for u in utterances),
             })
+            repaired = f", {len(starved) - still_missing} repaired" if starved else ""
+            missing = f", [yellow]{still_missing} still missing[/]" if still_missing else ""
             progress.update(row, total=1, completed=1,
-                            status=f"[green]✓ {len(utterances)} utterances[/]")
+                            status=f"[green]✓ {len(utterances)} utterances{repaired}[/]{missing}")
 
         progress.update(overall, status="[bold green]done ✨[/]")
 

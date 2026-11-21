@@ -124,14 +124,18 @@ So, for each track the script:
 
 1. **Finds where the person speaks**, using ffmpeg's `silencedetect`.
 2. **Cuts out the silence** and keeps only the speech, with a 1-second pause between pieces. It saves the result as 16 kHz mono FLAC, which is the format Groq recommends. Uploads shrink a lot: a 25-minute track where someone talks for 20 seconds becomes a 20-second upload.
-3. **Transcribes it with per-word timestamps**, then maps each word back to its time in the original recording.
-4. **Merges all speakers** into one chronological conversation.
+3. **Transcribes it in chunks of up to 2 minutes, with per-word timestamps**, then maps each word back to its time in the original recording. Whisper sometimes skips or garbles a 30-second stretch of long audio, and shorter uploads make that rarer. The end of each chunk's transcript is sent as context with the next one, so Whisper keeps the thread across chunks.
+4. **Repairs skipped passages.** It drops runs of made-up words, which Whisper squashes onto a single instant. Then it re-transcribes any speech region of 1 s or more that came back with almost no words, together with the speech around it. A repair that only produces a stock phrase like "Dziękuję za uwagę" is rejected.
+5. **Cleans up repeats:** a sentence that just repeats the end of the previous one is removed.
+6. **Merges all speakers** into one chronological conversation.
 
 Craig starts every track at the beginning of the recording, so all the timestamps share the same timeline.
 
 ## Limitations
 
-- **Upload size:** Groq's free tier accepts files up to 25 MB (100 MB on the dev tier). Multi-track uploads are small because the silence is removed. A long single-file recording can go over the limit, in which case the script prints a warning.
+- **Upload size:** Groq's free tier accepts files up to 25 MB (100 MB on the dev tier). Multi-track uploads are always small: the silence is removed and each chunk is at most 2 minutes long. A long single-file recording can go over the limit, in which case the script prints a warning.
+- **Single-file mode can skip passages:** the chunking and repair pass only apply to multi-track recordings. A long single file is sent in one piece, so Whisper can still skip parts of it.
+- **Repairs aren't guaranteed:** if a re-transcribed region still comes back nearly empty, the progress line shows "still missing".
 - **Timing of very short replies:** they're sometimes split oddly, because Whisper's word timing is imprecise at the points where silence was cut out.
 - **People talking over each other:** in multi-track mode each person has their own track, so this works fine. In single-file mode it can reduce accuracy.
 
